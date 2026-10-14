@@ -13,7 +13,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use crate::converter::RubyValueConverter;
-use crate::io::{RubyIOWriter, RubyIoSink, RubyIoSinkError};
+use crate::io::{RubyIOWriter, RubyIoFailure, RubyIoSink};
 use crate::logger::RubyLogger;
 use crate::schema::{extract_field_schemas, process_schema_value, ruby_schema_to_parquet};
 use crate::string_cache::StringCache;
@@ -59,7 +59,7 @@ enum WriterOutput {
     UnstagedIo {
         writer: parquet_core::Writer<OutputSink>,
         io_object: Value,
-        sink_error: RubyIoSinkError,
+        io_failure: RubyIoFailure,
     },
 }
 
@@ -113,7 +113,7 @@ impl WriterOutput {
     /// writer's own.
     fn writer_error(&self, ruby: &Ruby, error: impl ToString) -> MagnusError {
         match self {
-            Self::UnstagedIo { sink_error, .. } => sink_writer_error(ruby, sink_error, error),
+            Self::UnstagedIo { io_failure, .. } => io_writer_error(ruby, io_failure, error),
             Self::Path { .. } | Self::Io { .. } => {
                 MagnusError::new(ruby.exception_runtime_error(), error.to_string())
             }
@@ -121,12 +121,11 @@ impl WriterOutput {
     }
 }
 
-fn sink_writer_error(
-    ruby: &Ruby,
-    sink_error: &RubyIoSinkError,
-    error: impl ToString,
-) -> MagnusError {
-    sink_error
+/// The error to raise for a failure of a Parquet writer that writes to an IO
+/// object: the error that the IO object raised, when it raised one, otherwise the
+/// writer's own.
+fn io_writer_error(ruby: &Ruby, io_failure: &RubyIoFailure, error: impl ToString) -> MagnusError {
+    io_failure
         .take(ruby)
         .unwrap_or_else(|| MagnusError::new(ruby.exception_runtime_error(), error.to_string()))
 }
@@ -182,15 +181,15 @@ fn create_writer(
             })
         }
         PreparedWriterOutput::UnstagedIo { io_object } => {
-            let sink_error = RubyIoSinkError::default();
-            let sink = OutputSink::Io(RubyIoSink::new(io_object, sink_error.clone()));
+            let io_failure = RubyIoFailure::default();
+            let sink = OutputSink::Io(RubyIoSink::new(io_object, io_failure.clone()));
             let writer = builder
                 .build(sink, schema)
-                .map_err(|error| sink_writer_error(ruby, &sink_error, error))?;
+                .map_err(|error| io_writer_error(ruby, &io_failure, error))?;
             Ok(WriterOutput::UnstagedIo {
                 writer,
                 io_object,
-                sink_error,
+                io_failure,
             })
         }
     }
@@ -512,11 +511,11 @@ fn finalize_writer(ruby: &Ruby, writer_output: WriterOutput) -> Result<(), Magnu
         WriterOutput::UnstagedIo {
             writer,
             io_object,
-            sink_error,
+            io_failure,
         } => {
             writer
                 .close()
-                .map_err(|error| sink_writer_error(ruby, &sink_error, error))?;
+                .map_err(|error| io_writer_error(ruby, &io_failure, error))?;
             if io_object.respond_to("flush", false)? {
                 let _: Value = io_object.funcall("flush", ())?;
             }

@@ -110,7 +110,7 @@ class WriteUnstagedIoTest < Minitest::Test
     assert_equal staged.string.b, unstaged.bytes
   end
 
-  def test_row_groups_reach_the_io_while_rows_are_still_being_written
+  def test_each_row_group_reaches_the_io_once_it_is_complete
     io = RecordingIO.new
     received_before_last_row = nil
     rows = Enumerator.new do |yielder|
@@ -120,10 +120,11 @@ class WriteUnstagedIoTest < Minitest::Test
 
     Parquet.write_rows(rows, schema: ROW_SCHEMA, write_to: io, **LARGE_OPTIONS)
 
-    output = StringIO.new(io.bytes)
-    assert_operator Parquet.metadata(output).fetch("row_groups").length, :>, 1
-    assert_operator received_before_last_row, :>, 0
-    assert_operator received_before_last_row, :<, io.bytesize
+    # Every row group but the last is complete before the last row is written, so
+    # the IO holds exactly those row groups: it ends where a later one starts.
+    starts = row_group_starts(io.bytes)
+    assert_operator starts.length, :>, 1
+    assert_includes starts.drop(1), received_before_last_row
     assert_equal LARGE_ROW_COUNT, Parquet.each_row(StringIO.new(io.bytes)).count
   end
 
@@ -203,6 +204,35 @@ class WriteUnstagedIoTest < Minitest::Test
     assert_equal 1, io.calls
   end
 
+  def test_raises_the_error_of_the_io_unchanged_while_the_gc_runs_constantly
+    io = FailingIO.new
+
+    error = assert_raises(FailingIO::Failure) do
+      GC.stress = true
+      begin
+        Parquet.write_rows([[1, "one"]].each, schema: ROW_SCHEMA, write_to: io, stage_io: false)
+      ensure
+        GC.stress = false
+      end
+    end
+
+    assert_same io.raised, error
+  end
+
+  def test_raises_when_write_returns_a_negative_count
+    io = Class.new do
+      def write(_data)
+        -1
+      end
+    end.new
+
+    error = assert_raises(IOError) do
+      Parquet.write_rows(small_rows, schema: ROW_SCHEMA, write_to: io, stage_io: false)
+    end
+
+    assert_match(/write returned -1/, error.message)
+  end
+
   def test_a_throw_from_the_io_leaves_the_write
     result = catch(:stop_writing) do
       Parquet.write_rows(small_rows, schema: ROW_SCHEMA, write_to: ThrowingIO.new, stage_io: false)
@@ -272,5 +302,14 @@ class WriteUnstagedIoTest < Minitest::Test
 
   def large_row(index)
     [index, format("%0100d", index)]
+  end
+
+  # Returns the offset of the first page of each row group of the file.
+  def row_group_starts(bytes)
+    Parquet.metadata(StringIO.new(bytes)).fetch("row_groups").map do |row_group|
+      row_group.fetch("columns").flat_map do |column|
+        [column["dictionary_page_offset"], column["data_page_offset"]].compact
+      end.min
+    end
   end
 end
