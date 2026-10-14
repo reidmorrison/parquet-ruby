@@ -335,16 +335,9 @@ impl Write for RubyIOWriter {
             return Ok(0);
         }
 
-        // Convert bytes to Ruby string
-        let ruby_string = ruby.str_from_slice(buf);
-
-        // Call io.write(string)
-        let result: Result<usize, MagnusError> = self.io.funcall("write", (ruby_string,));
-
-        match result {
-            Ok(bytes_written) => Ok(bytes_written),
-            Err(e) => Err(IoError::new(ErrorKind::Other, e.to_string())),
-        }
+        write_to_io(&ruby, self.io, buf)
+            .map(|()| buf.len())
+            .map_err(|error| IoError::other(error.to_string()))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

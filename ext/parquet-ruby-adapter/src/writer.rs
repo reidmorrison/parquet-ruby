@@ -3,7 +3,7 @@ use magnus::{Enumerator, Error as MagnusError, RArray, Ruby, TryConvert, Value};
 use parquet_core::writer::WriterBuilder;
 use parquet_core::{Schema, SchemaNode};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use tempfile::{NamedTempFile, TempPath};
 
@@ -13,7 +13,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use crate::converter::RubyValueConverter;
-use crate::io::{RubyIOWriter, RubyIoFailure, RubyIoSink};
+use crate::io::{RubyIoFailure, RubyIoSink};
 use crate::logger::RubyLogger;
 use crate::schema::{extract_field_schemas, process_schema_value, ruby_schema_to_parquet};
 use crate::string_cache::StringCache;
@@ -221,13 +221,12 @@ fn prepare_writer_output(
             destination,
             final_state,
         })
+    } else if !write_to.respond_to("write", false)? {
+        Err(MagnusError::new(
+            ruby.exception_type_error(),
+            "write_to must be a String path or an IO object that responds to 'write'",
+        ))
     } else if !stage_io {
-        if !write_to.respond_to("write", false)? {
-            return Err(MagnusError::new(
-                ruby.exception_type_error(),
-                "write_to must be a String path or an IO object that responds to 'write'",
-            ));
-        }
         Ok(PreparedWriterOutput::UnstagedIo {
             io_object: write_to,
         })
@@ -516,10 +515,7 @@ fn finalize_writer(ruby: &Ruby, writer_output: WriterOutput) -> Result<(), Magnu
             writer
                 .close()
                 .map_err(|error| io_writer_error(ruby, &io_failure, error))?;
-            if io_object.respond_to("flush", false)? {
-                let _: Value = io_object.funcall("flush", ())?;
-            }
-            Ok(())
+            flush_io(io_object)
         }
     }
 }
@@ -570,21 +566,28 @@ fn copy_temp_file_to_io(
             format!("Failed to reopen temporary file: {error}"),
         )
     })?;
-    let mut reader = BufReader::new(file);
-    let mut writer = BufWriter::new(RubyIOWriter::new(io_object));
+    let io_failure = RubyIoFailure::default();
+    let mut sink = RubyIoSink::new(io_object, io_failure.clone());
 
-    std::io::copy(&mut reader, &mut writer).map_err(|error| {
-        MagnusError::new(
-            ruby.exception_runtime_error(),
-            format!("Failed to copy temp file to IO object: {error}"),
-        )
-    })?;
-    writer.flush().map_err(|error| {
-        MagnusError::new(
-            ruby.exception_runtime_error(),
-            format!("Failed to flush IO object: {error}"),
-        )
-    })
+    std::io::copy(&mut BufReader::new(file), &mut sink)
+        .and_then(|_| sink.flush())
+        .map_err(|error| {
+            io_writer_error(
+                ruby,
+                &io_failure,
+                format!("Failed to copy temp file to IO object: {error}"),
+            )
+        })?;
+    flush_io(io_object)
+}
+
+/// Calls the IO object's `flush` once the whole file has been written to it, when
+/// the IO object has one.
+fn flush_io(io_object: Value) -> Result<(), MagnusError> {
+    if io_object.respond_to("flush", false)? {
+        let _: Value = io_object.funcall("flush", ())?;
+    }
+    Ok(())
 }
 
 fn input_enumerator(ruby: &Ruby, input: Value) -> Result<Enumerator, MagnusError> {

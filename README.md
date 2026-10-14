@@ -170,17 +170,17 @@ been written. On Unix, replacing an existing path preserves its uid, gid, and
 mode and uses standard last-committer-wins rename semantics; creating a path is
 no-clobber. Extended attributes and ACLs are not preserved. IO output is first
 staged on disk, then copied to the IO; a failed copy may leave the IO partially
-written.
+written. The IO must respond to `write`, otherwise `TypeError` is raised before
+any row is read, and `flush` is called once the file is complete when the IO
+responds to it. An error raised by the IO, such as from `write`, is raised
+unchanged, and nothing more is written to the IO after it.
 
 Pass `stage_io: false` to write to the IO while the file is encoded instead.
 Each row group reaches the IO as soon as it is complete, and the footer once the
 input ends, so the IO, such as a pipe or an upload, receives the file as it is
 written, and only the row group being encoded is staged on disk. If the write
-then fails, the IO holds a partial file. The IO must respond to `write`; `flush`
-is called once the file is complete when the IO responds to it. An error raised
-by the IO, such as from `write`, is raised unchanged, and nothing more is written
-to the IO after it. A path is always staged, so `stage_io: false` with a path
-raises `ArgumentError`.
+then fails, the IO holds a partial file. A path is always staged, so
+`stage_io: false` with a path raises `ArgumentError`.
 
 ```ruby
 # Upload to S3 in parts while the rows are written, without a local copy of the file
